@@ -1,0 +1,140 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Project 5 bootstrap - lets GitHub Actions in morithii/project5-containers
+  deploy to AWS with short-lived OIDC credentials (no stored access keys).
+  Deployed ONCE by hand; everything else is deployed by the pipeline.
+
+Parameters:
+  GitHubOrg:
+    Type: String
+    Default: morithii
+  RepoName:
+    Type: String
+    Default: project5-containers
+  # Only one GitHub OIDC provider can exist per account. Project 2 most likely
+  # created it already - pass its ARN here to reuse it. If left empty, this
+  # template creates a new one.
+  OIDCProviderArn:
+    Type: String
+    Default: ''
+
+Conditions:
+  CreateProvider: !Equals [!Ref OIDCProviderArn, '']
+
+Resources:
+  # Only created if no existing provider ARN was passed in
+  GitHubOIDCProvider:
+    Type: AWS::IAM::OIDCProvider
+    Condition: CreateProvider
+    Properties:
+      Url: https://token.actions.githubusercontent.com
+      ClientIdList:
+        - sts.amazonaws.com
+      ThumbprintList:
+        - 6938fd4d98bab03faadb97b34396831e3780aea1
+
+  DeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: github-actions-project5-deploy
+      # TRUST POLICY - who may assume this role:
+      # only GitHub's OIDC tokens, only for this repo, only from the main branch
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !If [CreateProvider, !Ref GitHubOIDCProvider, !Ref OIDCProviderArn]
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+              StringLike:
+                token.actions.githubusercontent.com:sub: !Sub repo:${GitHubOrg}/${RepoName}:ref:refs/heads/main
+      # PERMISSIONS - what the pipeline may do once it has assumed the role
+      Policies:
+        - PolicyName: project5-deploy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Manage only CloudFormation stacks whose names start with "project5-"
+              - Sid: CloudFormationProject5Stacks
+                Effect: Allow
+                Action: cloudformation:*
+                Resource: !Sub arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/project5-*/*
+              # Read-only calls that "aws cloudformation deploy" needs
+              - Sid: CloudFormationGlobal
+                Effect: Allow
+                Action:
+                  - cloudformation:ValidateTemplate
+                  - cloudformation:GetTemplateSummary
+                Resource: '*'
+
+              # "docker login" to ECR - this action cannot be scoped to a repo
+              - Sid: EcrLogin
+                Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: '*'
+              # Push/pull/manage only ECR repos whose names start with "project5-"
+              - Sid: EcrProject5Repos
+                Effect: Allow
+                Action: ecr:*
+                Resource: !Sub arn:aws:ecr:${AWS::Region}:${AWS::AccountId}:repository/project5-*
+
+              # CloudFormation builds the stacks using THIS role's permissions,
+              # so it needs the services the stacks will contain.
+              # Kept broad for the bootcamp - tighten later as a security exercise.
+              - Sid: ContainerInfrastructure
+                Effect: Allow
+                Action:
+                  - ecs:*                       # cluster, task definitions, service
+                  - ec2:*                       # VPC, subnets, security groups
+                  - elasticloadbalancing:*      # ALB in front of the containers
+                  - logs:*                      # CloudWatch log group for container logs
+                  - cloudwatch:*                # dashboards and alarms
+                  - application-autoscaling:*   # ECS service auto scaling
+                Resource: '*'
+
+              # Lets the stacks create IAM roles (e.g. the ECS task execution role),
+              # but only roles named "project5-*" (CloudFormation names them after the stack)
+              - Sid: IamProject5Roles
+                Effect: Allow
+                Action:
+                  - iam:CreateRole
+                  - iam:DeleteRole
+                  - iam:GetRole
+                  - iam:TagRole
+                  - iam:UntagRole
+                  - iam:UpdateAssumeRolePolicy
+                  - iam:AttachRolePolicy
+                  - iam:DetachRolePolicy
+                  - iam:PutRolePolicy
+                  - iam:DeleteRolePolicy
+                  - iam:GetRolePolicy
+                  - iam:ListRolePolicies
+                  - iam:ListAttachedRolePolicies
+                Resource: !Sub arn:aws:iam::${AWS::AccountId}:role/project5-*
+              # Those roles can be handed to ECS tasks, and to nothing else
+              - Sid: PassRoleToEcsTasks
+                Effect: Allow
+                Action: iam:PassRole
+                Resource: !Sub arn:aws:iam::${AWS::AccountId}:role/project5-*
+                Condition:
+                  StringEquals:
+                    iam:PassedToService: ecs-tasks.amazonaws.com
+              # The first use of ECS/ELB/autoscaling needs AWS's own service-linked roles
+              - Sid: ServiceLinkedRoles
+                Effect: Allow
+                Action: iam:CreateServiceLinkedRole
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    iam:AWSServiceName:
+                      - ecs.amazonaws.com
+                      - elasticloadbalancing.amazonaws.com
+                      - ecs.application-autoscaling.amazonaws.com
+
+Outputs:
+  DeployRoleArn:
+    Description: Store this in the GitHub repo as the AWS_ROLE_ARN variable
+    Value: !GetAtt DeployRole.Arn
