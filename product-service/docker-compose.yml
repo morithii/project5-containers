@@ -1,0 +1,36 @@
+# LOCAL DEVELOPMENT ONLY.
+# Runs the Product Service container next to a MySQL container that stands in
+# for Amazon RDS, so you can test the whole thing on your laptop for free.
+# The passwords here are throwaway local values - never reuse them on AWS.
+services:
+  db:
+    image: mysql:8.4
+    environment:
+      MYSQL_ROOT_PASSWORD: localroot
+      MYSQL_DATABASE: products
+      MYSQL_USER: app
+      MYSQL_PASSWORD: localpass
+    volumes:
+      # Any .sql file in this folder runs automatically on the FIRST start,
+      # which creates the products table and loads the sample rows.
+      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      # Lets the api service wait until MySQL is actually ready for connections.
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-plocalroot"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  api:
+    build: .                 # build from the Dockerfile in this folder
+    ports:
+      - "3000:3000"          # your Mac's port 3000 -> container's port 3000
+    environment:
+      DB_HOST: db            # the service name above doubles as its hostname
+      DB_PORT: "3306"
+      DB_USER: app
+      DB_PASSWORD: localpass
+      DB_NAME: products
+    depends_on:
+      db:
+        condition: service_healthy   # don't start until MySQL passes its health check

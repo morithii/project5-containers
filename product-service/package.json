@@ -1,0 +1,17 @@
+{
+  "name": "product-service",
+  "version": "1.0.0",
+  "description": "Product Service microservice - REST API returning products from Amazon RDS (MySQL)",
+  "private": true,
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "express": "^5.1.0",
+    "mysql2": "^3.14.0"
+  }
+}
