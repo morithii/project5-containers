@@ -11,9 +11,9 @@ Parameters:
   RepoName:
     Type: String
     Default: project5-containers
-  # Only one GitHub OIDC provider can exist per account. Project 2 most likely
-  # created it already - pass its ARN here to reuse it. If left empty, this
-  # template creates a new one.
+  # The GitHub OIDC provider can exist only once per account. Project 2 most
+  # likely created it already - paste its ARN here to reuse it. Leave it
+  # empty and this template creates a new one.
   OIDCProviderArn:
     Type: String
     Default: ''
@@ -62,7 +62,7 @@ Resources:
                 Effect: Allow
                 Action: cloudformation:*
                 Resource: !Sub arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/project5-*/*
-              # Read-only calls that "aws cloudformation deploy" needs
+              # Read-only calls that the "aws cloudformation deploy" command needs
               - Sid: CloudFormationGlobal
                 Effect: Allow
                 Action:
@@ -75,14 +75,17 @@ Resources:
                 Effect: Allow
                 Action: ecr:GetAuthorizationToken
                 Resource: '*'
-              # Push/pull/manage only ECR repos whose names start with "project5-"
+              # Push/pull/manage only the Product Service repo (the workbook's name)
+              # and any repo whose name starts with "project5-"
               - Sid: EcrProject5Repos
                 Effect: Allow
                 Action: ecr:*
-                Resource: !Sub arn:aws:ecr:${AWS::Region}:${AWS::AccountId}:repository/project5-*
+                Resource:
+                  - !Sub arn:aws:ecr:${AWS::Region}:${AWS::AccountId}:repository/product-service
+                  - !Sub arn:aws:ecr:${AWS::Region}:${AWS::AccountId}:repository/project5-*
 
-              # CloudFormation builds the stacks using THIS role's permissions,
-              # so it needs the services the stacks will contain.
+              # CloudFormation creates the infrastructure using THIS role's permissions,
+              # so the role needs the services the stacks will contain.
               # Kept broad for the bootcamp - tighten later as a security exercise.
               - Sid: ContainerInfrastructure
                 Effect: Allow
@@ -93,10 +96,15 @@ Resources:
                   - logs:*                      # CloudWatch log group for container logs
                   - cloudwatch:*                # dashboards and alarms
                   - application-autoscaling:*   # ECS service auto scaling
+                  - autoscaling:*               # EC2 Auto Scaling Group behind the ECS capacity provider
+                  - rds:*                       # the products database
+                  - secretsmanager:*            # database credentials secret
+                  - ssm:GetParameter            # look up the latest ECS-optimized AMI ID
+                  - ssm:GetParameters
                 Resource: '*'
 
-              # Lets the stacks create IAM roles (e.g. the ECS task execution role),
-              # but only roles named "project5-*" (CloudFormation names them after the stack)
+              # Let stacks create IAM roles (e.g. the ECS task execution role)
+              # but only roles named "project5-*" (CFN names them after the stack)
               - Sid: IamProject5Roles
                 Effect: Allow
                 Action:
@@ -114,15 +122,30 @@ Resources:
                   - iam:ListRolePolicies
                   - iam:ListAttachedRolePolicies
                 Resource: !Sub arn:aws:iam::${AWS::AccountId}:role/project5-*
-              # Those roles can be handed to ECS tasks, and to nothing else
-              - Sid: PassRoleToEcsTasks
+              # EC2 launch type: the container hosts need an instance profile
+              # (the "wrapper" that attaches an IAM role to an EC2 instance)
+              - Sid: IamProject5InstanceProfiles
+                Effect: Allow
+                Action:
+                  - iam:CreateInstanceProfile
+                  - iam:DeleteInstanceProfile
+                  - iam:GetInstanceProfile
+                  - iam:AddRoleToInstanceProfile
+                  - iam:RemoveRoleFromInstanceProfile
+                  - iam:TagInstanceProfile
+                Resource: !Sub arn:aws:iam::${AWS::AccountId}:instance-profile/project5-*
+              # Hand those roles to ECS tasks and to the EC2 container hosts - nothing else
+              - Sid: PassRoleToEcsTasksAndHosts
                 Effect: Allow
                 Action: iam:PassRole
                 Resource: !Sub arn:aws:iam::${AWS::AccountId}:role/project5-*
                 Condition:
                   StringEquals:
-                    iam:PassedToService: ecs-tasks.amazonaws.com
-              # The first use of ECS/ELB/autoscaling needs AWS's own service-linked roles
+                    iam:PassedToService:
+                      - ecs-tasks.amazonaws.com   # task role + task execution role
+                      - ec2.amazonaws.com         # container host instance role
+                      - ecs.amazonaws.com         # ECS infrastructure role (blue/green)
+              # First-time use of ECS/ELB/autoscaling needs AWS's own service-linked roles
               - Sid: ServiceLinkedRoles
                 Effect: Allow
                 Action: iam:CreateServiceLinkedRole
@@ -133,6 +156,8 @@ Resources:
                       - ecs.amazonaws.com
                       - elasticloadbalancing.amazonaws.com
                       - ecs.application-autoscaling.amazonaws.com
+                      - autoscaling.amazonaws.com
+                      - rds.amazonaws.com
 
 Outputs:
   DeployRoleArn:

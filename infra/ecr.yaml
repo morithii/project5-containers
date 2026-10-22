@@ -1,0 +1,74 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Project 5 - Exercise 2: Amazon ECR repository for the Product Service image.
+  Kept in its own stack (project5-ecr) because the repository must exist, and
+  hold an image, BEFORE the ECS stack can start any containers from it.
+
+Parameters:
+  RepositoryName:
+    Type: String
+    Default: product-service
+
+Resources:
+  ProductServiceRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Ref RepositoryName
+
+      # IMMUTABLE tags: once "abc123" is pushed, nothing can overwrite it.
+      # This guarantees that the image ECS is running is exactly the one you
+      # tested, and stops anyone silently replacing a deployed tag.
+      # (It also means we tag by version/git SHA - never a reusable "latest".)
+      ImageTagMutability: IMMUTABLE
+
+      # Scan every pushed image for known OS/package vulnerabilities (free basic scanning).
+      ImageScanningConfiguration:
+        ScanOnPush: true
+
+      # Encrypt images at rest with AWS-managed keys (no extra KMS cost).
+      EncryptionConfiguration:
+        EncryptionType: AES256
+
+      # Lifecycle policy - keeps storage cost down by deleting old images automatically.
+      # Rules are evaluated in priority order (lowest number first).
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Delete untagged images (leftover layers from re-pushes) after 1 day",
+                "selection": {
+                  "tagStatus": "untagged",
+                  "countType": "sinceImagePushed",
+                  "countUnit": "days",
+                  "countNumber": 1
+                },
+                "action": { "type": "expire" }
+              },
+              {
+                "rulePriority": 2,
+                "description": "Keep only the 10 most recent tagged images (enough to roll back)",
+                "selection": {
+                  "tagStatus": "any",
+                  "countType": "imageCountMoreThan",
+                  "countNumber": 10
+                },
+                "action": { "type": "expire" }
+              }
+            ]
+          }
+
+      # Allows "delete-stack" to remove the repo even if it still has images.
+      # Handy for a bootcamp you tear down to save money; in production you'd
+      # usually leave this off (and add DeletionPolicy: Retain) to protect images.
+      EmptyOnDelete: true
+
+Outputs:
+  RepositoryUri:
+    Description: Full image address - used for docker tag/push and the ECS task definition
+    Value: !GetAtt ProductServiceRepository.RepositoryUri
+    Export:
+      Name: project5-ecr-RepositoryUri   # lets the ECS stack import it later
+  RepositoryArn:
+    Value: !GetAtt ProductServiceRepository.Arn
