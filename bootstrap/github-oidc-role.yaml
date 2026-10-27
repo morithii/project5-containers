@@ -11,6 +11,16 @@ Parameters:
   RepoName:
     Type: String
     Default: project5-containers
+  # GitHub's "immutable subject" format adds the permanent numeric IDs of the
+  # account and repo to the OIDC token, e.g. repo:morithii@77978732/project5-containers@1428648939
+  # IDs never change, so a renamed/deleted-and-recreated repo can't reuse this trust.
+  # Find them with: gh api repos/OWNER/REPO/actions/oidc/customization/sub
+  GitHubOrgId:
+    Type: String
+    Default: '77978732'
+  RepoId:
+    Type: String
+    Default: '1428648939'
   # The GitHub OIDC provider can exist only once per account. Project 2 most
   # likely created it already - paste its ARN here to reuse it. Leave it
   # empty and this template creates a new one.
@@ -50,7 +60,7 @@ Resources:
               StringEquals:
                 token.actions.githubusercontent.com:aud: sts.amazonaws.com
               StringLike:
-                token.actions.githubusercontent.com:sub: !Sub repo:${GitHubOrg}/${RepoName}:ref:refs/heads/main
+                token.actions.githubusercontent.com:sub: !Sub repo:${GitHubOrg}@${GitHubOrgId}/${RepoName}@${RepoId}:ref:refs/heads/main
       # PERMISSIONS - what the pipeline may do once it has assumed the role
       Policies:
         - PolicyName: project5-deploy
