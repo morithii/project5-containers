@@ -1,0 +1,81 @@
+# CI/CD for the Product Service.
+# On every push to main that touches the app or the infrastructure:
+#   1. build the image for ARM64 and push it to ECR, tagged with the git SHA
+#   2. deploy the ECR stack (normally "no changes")
+#   3. deploy the main stack with the new ImageTag -> a new task definition revision
+# Authenticates with GitHub's OIDC token -> github-actions-project5-deploy.
+# No AWS access keys are stored anywhere.
+name: Build and deploy Product Service
+
+on:
+  push:
+    branches: [main]
+    paths:                      # skip the pipeline for README-only changes etc.
+      - 'product-service/**'
+      - 'infra/**'
+      - '.github/workflows/deploy.yml'
+  workflow_dispatch:            # adds a "Run workflow" button for manual runs
+
+permissions:
+  id-token: write               # allow the job to request an OIDC token
+  contents: read                # allow actions/checkout to read the repo
+
+concurrency:
+  group: deploy-project5        # never run two deploys at the same time
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: eu-west-2
+  ECR_REPOSITORY: product-service
+  IMAGE_TAG: ${{ github.sha }}  # unique per commit - works with IMMUTABLE tags
+
+jobs:
+  build-and-deploy:
+    # Native ARM64 runner (free for public repos): builds arm64 directly, no emulation
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # The ECR repo must exist before we can push to it
+      - name: Deploy ECR stack
+        run: |
+          aws cloudformation deploy \
+            --template-file infra/ecr.yaml \
+            --stack-name project5-ecr \
+            --no-fail-on-empty-changeset
+
+      - name: Log in to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push image (skipped if this commit's image already exists)
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+        run: |
+          # Tags are immutable, so re-running for the same commit would fail
+          # on push - check first and reuse the existing image.
+          if aws ecr describe-images --repository-name "$ECR_REPOSITORY" \
+               --image-ids imageTag="$IMAGE_TAG" >/dev/null 2>&1; then
+            echo "Image $IMAGE_TAG already in ECR - skipping build"
+            exit 0
+          fi
+          docker build --provenance=false \
+            -t "$REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" ./product-service
+          docker push "$REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+
+      # Parameters not listed (e.g. AllowedCidr) keep their current values
+      - name: Deploy main stack with the new image
+        run: |
+          aws cloudformation deploy \
+            --template-file infra/main.yaml \
+            --stack-name project5-containers \
+            --parameter-overrides ImageTag="$IMAGE_TAG" \
+            --capabilities CAPABILITY_IAM \
+            --no-fail-on-empty-changeset
