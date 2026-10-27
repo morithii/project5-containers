@@ -41,6 +41,12 @@ app.use((req, res) => {
 // "localhost" would only accept connections from within the container itself.
 const server = app.listen(PORT, '0.0.0.0', () => {
   console.log(`Product Service listening on port ${PORT}`);
+
+  // On ECS (DB_AUTO_MIGRATE=true) create the table + sample data if missing.
+  // Runs in the background, so the health check answers immediately.
+  if (process.env.DB_AUTO_MIGRATE === 'true') {
+    require('./migrate').migrateWithRetry();
+  }
 });
 
 // Graceful shutdown. When ECS stops a task (deploys, scale-in, Spot

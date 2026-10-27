@@ -1,0 +1,396 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Project 5 - Exercise 3: Product Service on Amazon ECS (EC2 launch type).
+  VPC + RDS MySQL + ECS cluster backed by a Graviton Auto Scaling Group +
+  task definition that runs the image from ECR.
+
+# =============================================================================
+# PARAMETERS
+# =============================================================================
+Parameters:
+  ImageTag:
+    Type: String
+    Default: v2
+    Description: Tag of the product-service image in ECR to run (the pipeline passes the git SHA)
+
+  AllowedCidr:
+    Type: String
+    Description: >
+      Your public IP as x.x.x.x/32 - TEMPORARY test access straight to the
+      container hosts for Exercise 3. Exercise 4 replaces this with an ALB.
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$'
+
+  InstanceType:
+    Type: String
+    Default: t4g.small     # Graviton (ARM64), 2 vCPU / 2 GiB - matches our arm64 image
+    AllowedValues: [t4g.micro, t4g.small, t4g.medium]
+
+  # AWS publishes the latest ECS-optimized AMI ID in SSM Parameter Store.
+  # This "SSM parameter type" makes CloudFormation look it up at deploy time,
+  # so the hosts always launch with the current, patched ECS AMI.
+  EcsAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ecs/optimized-ami/amazon-linux-2023/arm64/recommended/image_id
+
+# =============================================================================
+# RESOURCES
+# =============================================================================
+Resources:
+
+  # ---------------------------------------------------------------------------
+  # NETWORKING
+  # 2 public subnets  -> container hosts (and the ALB in Exercise 4)
+  # 2 private subnets -> RDS (no route to the internet at all)
+  # No NAT gateway on purpose: it costs ~$35/month. The hosts have public IPs
+  # so the ECS agent can pull images from ECR, but their security group only
+  # lets in traffic we explicitly allow.
+  # ---------------------------------------------------------------------------
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.50.0.0/16
+      EnableDnsSupport: true        # both required for the RDS endpoint
+      EnableDnsHostnames: true      # hostname to resolve inside the VPC
+      Tags: [{ Key: Name, Value: project5-vpc }]
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags: [{ Key: Name, Value: project5-igw }]
+
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  # !Select / !GetAZs picks the 1st and 2nd Availability Zones in the region,
+  # so the template works in any region without hard-coding "eu-west-2a".
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.50.0.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags: [{ Key: Name, Value: project5-public-a }]
+
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.50.1.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags: [{ Key: Name, Value: project5-public-b }]
+
+  PrivateSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.50.10.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags: [{ Key: Name, Value: project5-private-a }]
+
+  PrivateSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.50.11.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      Tags: [{ Key: Name, Value: project5-private-b }]
+
+  # Public route table: send all non-VPC traffic (0.0.0.0/0) to the internet gateway
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags: [{ Key: Name, Value: project5-public-rt }]
+
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetARouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetA
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnetBRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetB
+      RouteTableId: !Ref PublicRouteTable
+  # (Private subnets use the VPC's main route table: local traffic only.)
+
+  # ---------------------------------------------------------------------------
+  # SECURITY GROUPS
+  # ---------------------------------------------------------------------------
+  ContainerHostSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ECS container hosts - Product Service
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        # Bridge networking with dynamic host ports: Docker maps container
+        # port 3000 to a random host port in the Linux ephemeral range.
+        # TEMPORARY - only your IP, only for testing Exercise 3.
+        - IpProtocol: tcp
+          FromPort: 32768
+          ToPort: 65535
+          CidrIp: !Ref AllowedCidr
+          Description: TEMP test access from my IP (removed in Exercise 4)
+      # No egress rules listed = default "allow all outbound"
+      # (needed to reach ECR, CloudWatch Logs, Secrets Manager and RDS).
+      Tags: [{ Key: Name, Value: project5-hosts-sg }]
+
+  DatabaseSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: RDS MySQL - only reachable from the container hosts
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        # Referencing a security group (not an IP range) means "any instance
+        # in that group" - so new hosts added by Auto Scaling get access automatically.
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !Ref ContainerHostSecurityGroup
+          Description: MySQL from ECS container hosts
+      Tags: [{ Key: Name, Value: project5-db-sg }]
+
+  # ---------------------------------------------------------------------------
+  # DATABASE - Amazon RDS for MySQL
+  # ---------------------------------------------------------------------------
+  DatabaseSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Private subnets for the Product Service database
+      SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+
+  Database:
+    Type: AWS::RDS::DBInstance
+    # Bootcamp setting: delete the DB with the stack, no final snapshot (no
+    # leftover storage bills). In production use Snapshot or Retain.
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      DBInstanceIdentifier: project5-products-db
+      Engine: mysql
+      EngineVersion: '8.4.11'           # pinned; RDS applies minor patches in the maintenance window
+      DBInstanceClass: db.t4g.micro      # smallest Graviton class (~$15/month)
+      AllocatedStorage: '20'
+      StorageType: gp3
+      StorageEncrypted: true
+      DBName: products                   # creates the "products" database
+      MasterUsername: admin
+      # RDS generates the password and stores it in AWS Secrets Manager.
+      # It never appears in this template, the console, or your terminal -
+      # the ECS task reads it from Secrets Manager at startup.
+      ManageMasterUserPassword: true
+      DBSubnetGroupName: !Ref DatabaseSubnetGroup
+      VPCSecurityGroups: [!Ref DatabaseSecurityGroup]
+      PubliclyAccessible: false
+      MultiAZ: false                     # single AZ to save cost (DR comes later)
+      BackupRetentionPeriod: 1
+      DeletionProtection: false
+
+  # ---------------------------------------------------------------------------
+  # ECS CLUSTER + EC2 CAPACITY
+  # ---------------------------------------------------------------------------
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: project5-cluster
+      ClusterSettings:
+        - Name: containerInsights
+          Value: disabled                # extra cost; basic ECS metrics are free
+
+  # IAM role for the EC2 hosts: lets the ECS agent register with the cluster,
+  # pull images from ECR and write container logs.
+  ContainerHostRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ec2.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceforEC2Role
+        # Session Manager: open a shell on a host from the console/CLI without
+        # SSH keys or an open port 22 - handy for debugging.
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+
+  # An instance profile is the "container" that attaches an IAM role to EC2
+  ContainerHostInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref ContainerHostRole]
+
+  # Launch template = the blueprint for every host the Auto Scaling Group starts
+  ContainerHostLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        ImageId: !Ref EcsAmiId
+        InstanceType: !Ref InstanceType
+        IamInstanceProfile:
+          Arn: !GetAtt ContainerHostInstanceProfile.Arn
+        NetworkInterfaces:
+          - DeviceIndex: 0
+            AssociatePublicIpAddress: true
+            Groups: [!Ref ContainerHostSecurityGroup]
+        MetadataOptions:
+          HttpTokens: required           # IMDSv2 only (blocks SSRF-style credential theft)
+          HttpPutResponseHopLimit: 1     # containers can't reach the host's metadata/credentials
+        # Runs once at first boot: tells the ECS agent which cluster to join.
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            echo "ECS_CLUSTER=${Cluster}" >> /etc/ecs/ecs.config
+        TagSpecifications:
+          - ResourceType: instance
+            Tags: [{ Key: Name, Value: project5-ecs-host }]
+
+  ContainerHostAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      VPCZoneIdentifier: [!Ref PublicSubnetA, !Ref PublicSubnetB]
+      LaunchTemplate:
+        LaunchTemplateId: !Ref ContainerHostLaunchTemplate
+        Version: !GetAtt ContainerHostLaunchTemplate.LatestVersionNumber
+      # MinSize 0: with no tasks running there are no hosts and no EC2 bill.
+      # ECS managed scaling (below) adds a host when a task needs one.
+      MinSize: '0'
+      MaxSize: '2'
+      Tags:
+        # Required by ECS managed scaling to recognise its own instances
+        - Key: AmazonECSManaged
+          Value: ''
+          PropagateAtLaunch: true
+
+  # Capacity provider = the link between the cluster and the ASG.
+  # Managed scaling: ECS watches how full the hosts are and grows/shrinks the
+  # ASG so there's always room for the tasks you ask for.
+  CapacityProvider:
+    Type: AWS::ECS::CapacityProvider
+    Properties:
+      AutoScalingGroupProvider:
+        AutoScalingGroupArn: !Ref ContainerHostAutoScalingGroup
+        ManagedScaling:
+          Status: ENABLED
+          TargetCapacity: 100            # aim for hosts to be fully used
+        ManagedTerminationProtection: DISABLED
+
+  ClusterCapacityProviders:
+    Type: AWS::ECS::ClusterCapacityProviderAssociations
+    Properties:
+      Cluster: !Ref Cluster
+      CapacityProviders: [!Ref CapacityProvider]
+      DefaultCapacityProviderStrategy:
+        - CapacityProvider: !Ref CapacityProvider
+          Weight: 1
+
+  # ---------------------------------------------------------------------------
+  # TASK DEFINITION - "how to run the container"
+  # ---------------------------------------------------------------------------
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /ecs/product-service
+      RetentionInDays: 7               # don't keep (and pay for) logs forever
+
+  # Task EXECUTION role: used by the ECS agent (not your code) to pull the
+  # image, write logs, and fetch secrets before the container starts.
+  TaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: read-db-secret
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Only THIS database's secret - nothing else in Secrets Manager
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !GetAtt Database.MasterUserSecret.SecretArn
+  # (No task ROLE: the app itself never calls AWS APIs.)
+
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: product-service
+      RequiresCompatibilities: [EC2]
+      NetworkMode: bridge                # Docker's bridge network on each host
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      ContainerDefinitions:
+        - Name: product-service
+          Image: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/product-service:${ImageTag}'
+          Essential: true
+          Cpu: 256                       # 1/4 of a vCPU reserved
+          MemoryReservation: 256         # soft limit (MiB) used for placement...
+          Memory: 512                    # ...hard limit: container is killed above this
+          PortMappings:
+            - ContainerPort: 3000
+              HostPort: 0                # 0 = Docker picks a free host port (dynamic)
+              Protocol: tcp
+          Environment:
+            - { Name: DB_HOST, Value: !GetAtt Database.Endpoint.Address }
+            - { Name: DB_PORT, Value: !GetAtt Database.Endpoint.Port }
+            - { Name: DB_NAME, Value: products }
+            - { Name: DB_SSL, Value: 'true' }
+            - { Name: DB_AUTO_MIGRATE, Value: 'true' }
+          # Pulled from Secrets Manager by the agent at startup and handed to the
+          # container as env vars - the values are never stored in the task
+          # definition. The ":username::" suffix picks one key from the JSON secret.
+          Secrets:
+            - Name: DB_USER
+              ValueFrom: !Sub '${Database.MasterUserSecret.SecretArn}:username::'
+            - Name: DB_PASSWORD
+              ValueFrom: !Sub '${Database.MasterUserSecret.SecretArn}:password::'
+          LogConfiguration:
+            LogDriver: awslogs           # container stdout/stderr -> CloudWatch Logs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: product-service
+          HealthCheck:
+            Command: ['CMD-SHELL', 'wget -qO- http://localhost:3000/health || exit 1']
+            Interval: 30
+            Timeout: 5
+            Retries: 3
+            StartPeriod: 15
+
+# =============================================================================
+# OUTPUTS
+# =============================================================================
+Outputs:
+  ClusterName:
+    Value: !Ref Cluster
+  CapacityProviderName:
+    Value: !Ref CapacityProvider
+  TaskDefinitionArn:
+    Value: !Ref TaskDefinition
+  DatabaseEndpoint:
+    Value: !GetAtt Database.Endpoint.Address
+  DatabaseSecretArn:
+    Description: Secrets Manager secret holding the DB username/password
+    Value: !GetAtt Database.MasterUserSecret.SecretArn
+  VpcId:
+    Value: !Ref Vpc
+    Export: { Name: project5-VpcId }

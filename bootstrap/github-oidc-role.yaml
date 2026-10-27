@@ -102,6 +102,22 @@ Resources:
                   - ssm:GetParameter            # look up the latest ECS-optimized AMI ID
                   - ssm:GetParameters
                 Resource: '*'
+              # RDS-managed master password: RDS encrypts the secret with the
+              # AWS-managed Secrets Manager KMS key using the caller's permissions.
+              # Only allowed when the request comes through Secrets Manager or RDS.
+              - Sid: KmsForRdsManagedSecret
+                Effect: Allow
+                Action:
+                  - kms:DescribeKey
+                  - kms:CreateGrant
+                  - kms:GenerateDataKey
+                  - kms:Decrypt
+                Resource: '*'
+                Condition:
+                  StringLike:
+                    kms:ViaService:
+                      - !Sub secretsmanager.${AWS::Region}.amazonaws.com
+                      - !Sub rds.${AWS::Region}.amazonaws.com
 
               # Let stacks create IAM roles (e.g. the ECS task execution role)
               # but only roles named "project5-*" (CFN names them after the stack)
