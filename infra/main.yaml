@@ -1,8 +1,8 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: >
-  Project 5 - Exercise 3: Product Service on Amazon ECS (EC2 launch type).
-  VPC + RDS MySQL + ECS cluster backed by a Graviton Auto Scaling Group +
-  task definition that runs the image from ECR.
+  Project 5 - Product Service on Amazon ECS (EC2 launch type).
+  Exercise 3: VPC + RDS MySQL + ECS cluster on a Graviton Auto Scaling Group + task definition.
+  Exercise 4: ECS Service behind an Application Load Balancer, with service auto scaling.
 
 # =============================================================================
 # PARAMETERS
@@ -12,13 +12,6 @@ Parameters:
     Type: String
     Default: v2
     Description: Tag of the product-service image in ECR to run (the pipeline passes the git SHA)
-
-  AllowedCidr:
-    Type: String
-    Description: >
-      Your public IP as x.x.x.x/32 - TEMPORARY test access straight to the
-      container hosts for Exercise 3. Exercise 4 replaces this with an ALB.
-    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$'
 
   InstanceType:
     Type: String
@@ -131,6 +124,23 @@ Resources:
   # ---------------------------------------------------------------------------
   # SECURITY GROUPS
   # ---------------------------------------------------------------------------
+  # Exercise 4: the load balancer is the ONLY public entry point.
+  # Anyone on the internet may reach it on port 80...
+  LoadBalancerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Public ALB for the Product Service
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: HTTP from anywhere
+      Tags: [{ Key: Name, Value: project5-alb-sg }]
+
+  # ...but the container hosts now accept traffic ONLY from the load balancer.
+  # (Exercise 3's temporary "my IP" rule is gone.)
   ContainerHostSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
@@ -138,13 +148,13 @@ Resources:
       VpcId: !Ref Vpc
       SecurityGroupIngress:
         # Bridge networking with dynamic host ports: Docker maps container
-        # port 3000 to a random host port in the Linux ephemeral range.
-        # TEMPORARY - only your IP, only for testing Exercise 3.
+        # port 3000 to a random host port in the Linux ephemeral range, and
+        # the ALB sends traffic to whichever port each task got.
         - IpProtocol: tcp
           FromPort: 32768
           ToPort: 65535
-          CidrIp: !Ref AllowedCidr
-          Description: TEMP test access from my IP (removed in Exercise 4)
+          SourceSecurityGroupId: !Ref LoadBalancerSecurityGroup
+          Description: Dynamic container ports - from the ALB only
       # No egress rules listed = default "allow all outbound"
       # (needed to reach ECR, CloudWatch Logs, Secrets Manager and RDS).
       Tags: [{ Key: Name, Value: project5-hosts-sg }]
@@ -376,10 +386,135 @@ Resources:
             Retries: 3
             StartPeriod: 15
 
+  # ---------------------------------------------------------------------------
+  # EXERCISE 4 - APPLICATION LOAD BALANCER
+  # One stable public URL that spreads requests across all healthy tasks,
+  # wherever ECS has placed them and whatever port they were given.
+  # ---------------------------------------------------------------------------
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: project5-alb
+      Scheme: internet-facing
+      Type: application
+      Subnets: [!Ref PublicSubnetA, !Ref PublicSubnetB]   # ALBs need 2+ AZs
+      SecurityGroups: [!Ref LoadBalancerSecurityGroup]
+
+  # Target group = the list of places the ALB can send traffic to.
+  # TargetType "instance" + bridge networking: each target is an EC2 host
+  # PLUS the dynamic port of one task on it. ECS registers and deregisters
+  # tasks here automatically as they start and stop.
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: project5-product-service
+      VpcId: !Ref Vpc
+      Protocol: HTTP
+      Port: 3000                       # placeholder - ECS supplies the real port per task
+      TargetType: instance
+      HealthCheckPath: /health         # the DB-independent health endpoint
+      HealthCheckPort: traffic-port    # check each task on ITS dynamic port
+      HealthCheckIntervalSeconds: 15
+      HealthyThresholdCount: 2         # 2 passes (~30s) before a new task gets traffic
+      UnhealthyThresholdCount: 3
+      Matcher: { HttpCode: '200' }
+      TargetGroupAttributes:
+        # On deploys/scale-in, wait 30s (default 300s) for in-flight requests
+        # to finish before removing a task - pairs with our graceful shutdown.
+        - Key: deregistration_delay.timeout_seconds
+          Value: '30'
+
+  HttpListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+
+  # ---------------------------------------------------------------------------
+  # EXERCISE 4 - ECS SERVICE
+  # A service keeps the desired number of tasks running at all times:
+  # it replaces tasks that crash or fail health checks, registers them with
+  # the ALB, and rolls out new task definition revisions with zero downtime.
+  # ---------------------------------------------------------------------------
+  Service:
+    Type: AWS::ECS::Service
+    DependsOn: [HttpListener, ClusterCapacityProviders]
+    Properties:
+      ServiceName: product-service
+      Cluster: !Ref Cluster
+      TaskDefinition: !Ref TaskDefinition   # new revision -> rolling deployment
+      DesiredCount: 2                       # two copies for availability
+      CapacityProviderStrategy:
+        - CapacityProvider: !Ref CapacityProvider
+          Weight: 1
+      LoadBalancers:
+        - TargetGroupArn: !Ref TargetGroup
+          ContainerName: product-service
+          ContainerPort: 3000
+      # Ignore failing ALB health checks for the first 60s while a task boots.
+      HealthCheckGracePeriodSeconds: 60
+      DeploymentConfiguration:
+        # Rolling update: start new tasks first (up to 200%), and never drop
+        # below 100% healthy - users always have working tasks to hit.
+        MinimumHealthyPercent: 100
+        MaximumPercent: 200
+        # If new tasks keep failing, stop the deployment and automatically
+        # roll back to the last working revision.
+        DeploymentCircuitBreaker:
+          Enable: true
+          Rollback: true
+      PlacementStrategies:
+        # First spread tasks across Availability Zones (survive an AZ outage)...
+        - Type: spread
+          Field: attribute:ecs.availability-zone
+        # ...then pack them onto as few hosts as possible (fewer EC2 bills).
+        - Type: binpack
+          Field: memory
+
+  # ---------------------------------------------------------------------------
+  # EXERCISE 4 - SERVICE AUTO SCALING (tasks)
+  # Two layers of scaling work together:
+  #   1. Service auto scaling (here) changes the NUMBER OF TASKS based on CPU.
+  #   2. Capacity provider managed scaling (above) changes the NUMBER OF EC2
+  #      HOSTS so there is always room for those tasks.
+  # ---------------------------------------------------------------------------
+  ServiceScalableTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Properties:
+      ServiceNamespace: ecs
+      ScalableDimension: ecs:service:DesiredCount
+      ResourceId: !Sub 'service/${Cluster}/${Service.Name}'
+      MinCapacity: 2
+      MaxCapacity: 4
+      # No RoleARN: AWS uses the Application Auto Scaling service-linked role.
+
+  ServiceCpuScalingPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: product-service-cpu-target-tracking
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref ServiceScalableTarget
+      TargetTrackingScalingPolicyConfiguration:
+        # Add/remove tasks to keep average CPU across the service near 50%
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ECSServiceAverageCPUUtilization
+        TargetValue: 50
+        ScaleOutCooldown: 60     # react quickly to load
+        ScaleInCooldown: 300     # remove capacity slowly, avoids flapping
+
 # =============================================================================
 # OUTPUTS
 # =============================================================================
 Outputs:
+  LoadBalancerUrl:
+    Description: Public URL of the Product Service
+    Value: !Sub 'http://${LoadBalancer.DNSName}/products'
+  ServiceName:
+    Value: !GetAtt Service.Name
   ClusterName:
     Value: !Ref Cluster
   CapacityProviderName:
