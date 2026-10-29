@@ -35,10 +35,14 @@ Resources:
   # connection"), which installs the AWS Connector app on your GitHub account.
   # This replaces stored GitHub tokens: AWS gets scoped, revocable access.
   # ---------------------------------------------------------------------------
+  # Renamed from project5-github: that connection was approved WITHOUT the
+  # GitHub App installed, so it could read code but never received push
+  # events. A new name makes CloudFormation create a fresh connection, which
+  # is approved WITH the app installation selected -> pushes trigger the pipeline.
   GitHubConnection:
     Type: AWS::CodeStarConnections::Connection
     Properties:
-      ConnectionName: project5-github
+      ConnectionName: project5-github-app
       ProviderType: GitHub
 
   # ---------------------------------------------------------------------------
