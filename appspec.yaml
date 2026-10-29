@@ -1,0 +1,13 @@
+# CodeDeploy AppSpec for an ECS blue/green deployment.
+# Tells CodeDeploy which service is being deployed and which container/port
+# to register in the green target group. <TASK_DEFINITION> is filled in by the
+# pipeline with the new task definition revision it registers for each deploy.
+version: 0.0
+Resources:
+  - TargetService:
+      Type: AWS::ECS::Service
+      Properties:
+        TaskDefinition: <TASK_DEFINITION>
+        LoadBalancerInfo:
+          ContainerName: product-service   # must match the container name in the task definition
+          ContainerPort: 3000              # the port the app listens on inside the container

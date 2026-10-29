@@ -1,0 +1,264 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Project 5 - CI/CD exercise: AWS CodePipeline for the Product Service.
+  GitHub (via CodeConnections) -> CodeBuild (build + push image to ECR)
+  -> CodeDeploy blue/green deployment to the ECS service.
+  Deployed once by hand as the "project5-pipeline" stack.
+
+Parameters:
+  GitHubRepository:
+    Type: String
+    Default: morithii/project5-containers
+  BranchName:
+    Type: String
+    Default: main
+  EcrRepositoryName:
+    Type: String
+    Default: product-service
+  TaskFamily:
+    Type: String
+    Default: product-service
+  # Created by infra/main.yaml (project5-containers stack)
+  CodeDeployApplicationName:
+    Type: String
+    Default: project5-product-service
+  CodeDeployDeploymentGroupName:
+    Type: String
+    Default: project5-product-service-dg
+
+Resources:
+
+  # ---------------------------------------------------------------------------
+  # SOURCE - connection to GitHub
+  # CloudFormation creates it in PENDING state. You must approve it ONCE in the
+  # console (Developer Tools > Settings > Connections > "Update pending
+  # connection"), which installs the AWS Connector app on your GitHub account.
+  # This replaces stored GitHub tokens: AWS gets scoped, revocable access.
+  # ---------------------------------------------------------------------------
+  GitHubConnection:
+    Type: AWS::CodeStarConnections::Connection
+    Properties:
+      ConnectionName: project5-github
+      ProviderType: GitHub
+
+  # ---------------------------------------------------------------------------
+  # ARTIFACT BUCKET - where stages hand files to each other
+  # (source zip -> CodeBuild; imageDetail/taskdef/appspec -> CodeDeploy)
+  # ---------------------------------------------------------------------------
+  ArtifactBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireOldArtifacts        # artifacts are only needed briefly
+            Status: Enabled
+            ExpirationInDays: 30
+
+  # ---------------------------------------------------------------------------
+  # BUILD - CodeBuild project
+  # ---------------------------------------------------------------------------
+  CodeBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: codebuild.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: product-service-build
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: BuildLogs
+                Effect: Allow
+                Action: [logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/project5-*'
+              - Sid: Artifacts
+                Effect: Allow
+                Action: [s3:GetObject, s3:GetObjectVersion, s3:PutObject]
+                Resource: !Sub '${ArtifactBucket.Arn}/*'
+              - Sid: EcrLogin
+                Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: '*'
+              # Push to (and check) only the product-service repository
+              - Sid: EcrPush
+                Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:InitiateLayerUpload
+                  - ecr:UploadLayerPart
+                  - ecr:CompleteLayerUpload
+                  - ecr:PutImage
+                  - ecr:BatchGetImage
+                  - ecr:DescribeImages
+                Resource: !Sub 'arn:aws:ecr:${AWS::Region}:${AWS::AccountId}:repository/${EcrRepositoryName}'
+              # Read the current task definition to build taskdef.json
+              - Sid: ReadTaskDefinition
+                Effect: Allow
+                Action: ecs:DescribeTaskDefinition
+                Resource: '*'
+
+  CodeBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: project5-product-service-build
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+      Source:
+        Type: CODEPIPELINE            # code arrives from the pipeline's Source stage
+        BuildSpec: buildspec.yml      # instructions live in the repo
+      Artifacts:
+        Type: CODEPIPELINE            # outputs go back to the pipeline
+      Environment:
+        # ARM64 build machine -> builds our arm64 image natively (no emulation)
+        Type: ARM_CONTAINER
+        Image: aws/codebuild/amazonlinux-aarch64-standard:3.0
+        ComputeType: BUILD_GENERAL1_SMALL
+        PrivilegedMode: true          # required to run Docker inside CodeBuild
+        EnvironmentVariables:
+          - { Name: AWS_ACCOUNT_ID, Value: !Ref AWS::AccountId }
+          - { Name: REPO_NAME, Value: !Ref EcrRepositoryName }
+          - { Name: TASK_FAMILY, Value: !Ref TaskFamily }
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+          GroupName: /aws/codebuild/project5-product-service
+      TimeoutInMinutes: 20
+
+  # ---------------------------------------------------------------------------
+  # PIPELINE
+  # ---------------------------------------------------------------------------
+  PipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: codepipeline.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: product-service-pipeline
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: Artifacts
+                Effect: Allow
+                Action: [s3:GetObject, s3:GetObjectVersion, s3:PutObject, s3:GetBucketVersioning, s3:GetBucketLocation, s3:ListBucket]
+                Resource: [!GetAtt ArtifactBucket.Arn, !Sub '${ArtifactBucket.Arn}/*']
+              - Sid: UseGitHubConnection
+                Effect: Allow
+                Action: [codestar-connections:UseConnection, codeconnections:UseConnection]
+                Resource: !Ref GitHubConnection
+              - Sid: RunBuild
+                Effect: Allow
+                Action: [codebuild:StartBuild, codebuild:BatchGetBuilds]
+                Resource: !GetAtt CodeBuildProject.Arn
+              # The CodeDeployToECS action creates the deployment...
+              - Sid: Deploy
+                Effect: Allow
+                Action:
+                  - codedeploy:CreateDeployment
+                  - codedeploy:GetDeployment
+                  - codedeploy:GetApplication
+                  - codedeploy:GetApplicationRevision
+                  - codedeploy:RegisterApplicationRevision
+                  - codedeploy:GetDeploymentConfig
+                Resource: '*'
+              # ...and registers the new task definition revision itself
+              - Sid: RegisterTaskDefinition
+                Effect: Allow
+                Action: [ecs:RegisterTaskDefinition, ecs:DescribeTaskDefinition, ecs:DescribeServices, ecs:TagResource]
+                Resource: '*'
+              # Registering a task definition "passes" its roles to ECS
+              - Sid: PassTaskRoles
+                Effect: Allow
+                Action: iam:PassRole
+                Resource: !Sub 'arn:aws:iam::${AWS::AccountId}:role/project5-containers-*'
+                Condition:
+                  StringEquals:
+                    iam:PassedToService: ecs-tasks.amazonaws.com
+
+  Pipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name: project5-product-service
+      PipelineType: V2
+      ExecutionMode: QUEUED            # a new push waits for the running deploy to finish
+      RoleArn: !GetAtt PipelineRole.Arn
+      ArtifactStore:
+        Type: S3
+        Location: !Ref ArtifactBucket
+      Stages:
+        # 1. SOURCE: every push to main starts the pipeline
+        - Name: Source
+          Actions:
+            - Name: Source
+              Namespace: SourceVariables          # exposes #{SourceVariables.CommitId}
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: CodeStarSourceConnection
+                Version: '1'
+              Configuration:
+                ConnectionArn: !Ref GitHubConnection
+                FullRepositoryId: !Ref GitHubRepository
+                BranchName: !Ref BranchName
+                OutputArtifactFormat: CODE_ZIP
+                DetectChanges: true
+              OutputArtifacts: [{ Name: SourceOutput }]
+
+        # 2. BUILD: CodeBuild builds/pushes the image, writes the deploy files
+        - Name: Build
+          Actions:
+            - Name: BuildImage
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              Configuration:
+                ProjectName: !Ref CodeBuildProject
+                # Pass the commit ID into the build -> used as the image tag
+                EnvironmentVariables: '[{"name":"COMMIT_ID","value":"#{SourceVariables.CommitId}","type":"PLAINTEXT"}]'
+              InputArtifacts: [{ Name: SourceOutput }]
+              OutputArtifacts: [{ Name: BuildOutput }]
+
+        # 3. DEPLOY: CodeDeploy blue/green
+        - Name: Deploy
+          Actions:
+            - Name: BlueGreenDeploy
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CodeDeployToECS
+                Version: '1'
+              Configuration:
+                ApplicationName: !Ref CodeDeployApplicationName
+                DeploymentGroupName: !Ref CodeDeployDeploymentGroupName
+                TaskDefinitionTemplateArtifact: BuildOutput
+                TaskDefinitionTemplatePath: taskdef.json
+                AppSpecTemplateArtifact: BuildOutput
+                AppSpecTemplatePath: appspec.yaml
+                # Replace <IMAGE1_NAME> in taskdef.json with ImageURI from imageDetail.json
+                Image1ArtifactName: BuildOutput
+                Image1ContainerName: IMAGE1_NAME
+              InputArtifacts: [{ Name: BuildOutput }]
+
+Outputs:
+  ConnectionArn:
+    Description: Approve this connection once in the console before the pipeline can read GitHub
+    Value: !Ref GitHubConnection
+  PipelineUrl:
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/codesuite/codepipeline/pipelines/${Pipeline}/view?region=${AWS::Region}'

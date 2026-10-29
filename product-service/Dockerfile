@@ -1,12 +1,14 @@
-# syntax=docker/dockerfile:1
-#
 # Multi-stage build for the Product Service.
 # Stage 1 installs dependencies; stage 2 copies ONLY what's needed to run.
 # Anything left behind in stage 1 (npm cache, lockfile tooling) never reaches
 # the final image, which keeps it small and reduces the attack surface.
 
+# Base images come from Amazon ECR Public's mirror of the official Docker Hub
+# images. Identical images, but no Docker Hub rate limits - which matter in
+# CodeBuild, where many customers share the same outbound IP addresses.
+
 # ---------- Stage 1: install production dependencies ----------
-FROM node:22-alpine AS deps
+FROM public.ecr.aws/docker/library/node:22-alpine AS deps
 WORKDIR /app
 
 # Copy ONLY the dependency manifests first. Docker caches each layer, so as
@@ -19,7 +21,7 @@ COPY package.json package-lock.json ./
 RUN npm ci --omit=dev && npm cache clean --force
 
 # ---------- Stage 2: runtime image ----------
-FROM node:22-alpine AS runtime
+FROM public.ecr.aws/docker/library/node:22-alpine AS runtime
 
 # Tells Express and other libraries to run in production mode.
 ENV NODE_ENV=production \

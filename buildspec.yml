@@ -1,0 +1,61 @@
+# CodeBuild instructions for the Product Service (the "Build" stage of the pipeline).
+#
+# Produces three files that the CodeDeploy blue/green action needs:
+#   imageDetail.json - the URI of the image we just built
+#   taskdef.json     - the task definition, with <IMAGE1_NAME> where the image goes
+#   appspec.yaml     - tells CodeDeploy which container/port to wire to the ALB
+#
+# Environment variables set by the CodeBuild project / pipeline:
+#   AWS_ACCOUNT_ID, AWS_DEFAULT_REGION, REPO_NAME, TASK_FAMILY, COMMIT_ID
+version: 0.2
+
+phases:
+  pre_build:
+    commands:
+      - REGISTRY=$AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
+      # Tag = git commit ID: unique per change, works with IMMUTABLE tags,
+      # and you can always trace a running image back to its exact commit.
+      - IMAGE_TAG=$COMMIT_ID
+      - IMAGE_URI=$REGISTRY/$REPO_NAME:$IMAGE_TAG
+      - echo "Building $IMAGE_URI"
+      # Same ECR login as before: a 12-hour token piped straight into docker
+      - aws ecr get-login-password | docker login --username AWS --password-stdin $REGISTRY
+
+  build:
+    commands:
+      # Re-running the pipeline for the same commit would fail on push
+      # (immutable tags), so reuse the image if it's already in ECR.
+      - |
+        if aws ecr describe-images --repository-name "$REPO_NAME" --image-ids imageTag="$IMAGE_TAG" >/dev/null 2>&1; then
+          echo "Image $IMAGE_TAG already in ECR - skipping build"
+        else
+          docker build --provenance=false -t "$IMAGE_URI" ./product-service
+          docker push "$IMAGE_URI"
+        fi
+
+  post_build:
+    commands:
+      # 1. imageDetail.json - CodePipeline reads ImageURI from here and swaps
+      #    it into taskdef.json in place of <IMAGE1_NAME>.
+      - printf '{"ImageURI":"%s"}' "$IMAGE_URI" > imageDetail.json
+
+      # 2. taskdef.json - start from the CURRENT task definition (created by
+      #    CloudFormation, so it already has the right roles, DB endpoint and
+      #    secret references), swap the image for the placeholder, and remove
+      #    the read-only fields AWS adds that can't be sent back on register.
+      - aws ecs describe-task-definition --task-definition "$TASK_FAMILY" --query taskDefinition > current-taskdef.json
+      - |
+        jq '.containerDefinitions[0].image = "<IMAGE1_NAME>"
+            | del(.taskDefinitionArn, .revision, .status, .requiresAttributes,
+                  .compatibilities, .registeredAt, .registeredBy)' \
+          current-taskdef.json > taskdef.json
+      - cat taskdef.json
+
+      # 3. appspec.yaml comes straight from the repo (see appspec.yaml)
+      - echo "Build complete for commit $COMMIT_ID"
+
+artifacts:
+  files:
+    - imageDetail.json
+    - taskdef.json
+    - appspec.yaml

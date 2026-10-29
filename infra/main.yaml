@@ -3,6 +3,7 @@ Description: >
   Project 5 - Product Service on Amazon ECS (EC2 launch type).
   Exercise 3: VPC + RDS MySQL + ECS cluster on a Graviton Auto Scaling Group + task definition.
   Exercise 4: ECS Service behind an Application Load Balancer, with service auto scaling.
+  CI/CD exercise: CodeDeploy blue/green (two target groups, test listener, deployment group).
 
 # =============================================================================
 # PARAMETERS
@@ -137,6 +138,14 @@ Resources:
           ToPort: 80
           CidrIp: 0.0.0.0/0
           Description: HTTP from anywhere
+        # Blue/green TEST listener: during a deployment CodeDeploy points this
+        # port at the new (green) tasks so you can try them before real users do.
+        # Open to anyone for simplicity - in production, restrict to your IP/VPN.
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          CidrIp: 0.0.0.0/0
+          Description: Blue/green test traffic
       Tags: [{ Key: Name, Value: project5-alb-sg }]
 
   # ...but the container hosts now accept traffic ONLY from the load balancer.
@@ -410,14 +419,19 @@ Resources:
       Subnets: [!Ref PublicSubnetA, !Ref PublicSubnetB]   # ALBs need 2+ AZs
       SecurityGroups: [!Ref LoadBalancerSecurityGroup]
 
-  # Target group = the list of places the ALB can send traffic to.
+  # Target groups = the lists of places the ALB can send traffic to.
   # TargetType "instance" + bridge networking: each target is an EC2 host
   # PLUS the dynamic port of one task on it. ECS registers and deregisters
-  # tasks here automatically as they start and stop.
-  TargetGroup:
+  # tasks automatically as they start and stop.
+  #
+  # BLUE/GREEN needs TWO identical target groups. At any moment one holds the
+  # live version (production traffic) and the other receives the new version
+  # during a deployment. CodeDeploy swaps them on every deployment, so "blue"
+  # and "green" are just names - either one can be live.
+  TargetGroupBlue:
     Type: AWS::ElasticLoadBalancingV2::TargetGroup
     Properties:
-      Name: project5-product-service
+      Name: project5-tg-blue
       VpcId: !Ref Vpc
       Protocol: HTTP
       Port: 3000                       # placeholder - ECS supplies the real port per task
@@ -429,11 +443,33 @@ Resources:
       UnhealthyThresholdCount: 3
       Matcher: { HttpCode: '200' }
       TargetGroupAttributes:
-        # On deploys/scale-in, wait 30s (default 300s) for in-flight requests
-        # to finish before removing a task - pairs with our graceful shutdown.
+        # Wait 30s (default 300s) for in-flight requests to finish before a
+        # task is removed - pairs with the app's graceful shutdown.
         - Key: deregistration_delay.timeout_seconds
           Value: '30'
 
+  TargetGroupGreen:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: project5-tg-green
+      VpcId: !Ref Vpc
+      Protocol: HTTP
+      Port: 3000
+      TargetType: instance
+      HealthCheckPath: /health
+      HealthCheckPort: traffic-port
+      HealthCheckIntervalSeconds: 15
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher: { HttpCode: '200' }
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: '30'
+
+  # PRODUCTION listener (port 80) - what real users hit.
+  # IMPORTANT: after the first blue/green deployment CodeDeploy changes which
+  # target group this listener forwards to. Don't edit these listeners in the
+  # template afterwards, or CloudFormation would point them back at blue.
   HttpListener:
     Type: AWS::ElasticLoadBalancingV2::Listener
     Properties:
@@ -442,41 +478,55 @@ Resources:
       Protocol: HTTP
       DefaultActions:
         - Type: forward
-          TargetGroupArn: !Ref TargetGroup
+          TargetGroupArn: !Ref TargetGroupBlue
+
+  # TEST listener (port 8080) - CodeDeploy routes it to the green tasks while
+  # a deployment waits for approval, so you can test the new version first.
+  TestListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 8080
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroupBlue
 
   # ---------------------------------------------------------------------------
-  # EXERCISE 4 - ECS SERVICE
-  # A service keeps the desired number of tasks running at all times:
-  # it replaces tasks that crash or fail health checks, registers them with
-  # the ALB, and rolls out new task definition revisions with zero downtime.
+  # ECS SERVICE (Exercise 4, switched to blue/green in the CI/CD exercise)
+  # A service keeps the desired number of tasks running at all times and
+  # replaces tasks that crash or fail health checks.
+  #
+  # DeploymentController CODE_DEPLOY hands deployments over to CodeDeploy:
+  # the service no longer does rolling updates itself.
+  # Switching controller REPLACES the service, so it gets a new name
+  # (product-service-bg) to avoid clashing with the old one during the swap.
+  #
+  # LIMITATION to know: with CODE_DEPLOY, CloudFormation can no longer change
+  # this service's task definition. New versions are deployed ONLY by the
+  # pipeline (CodeDeploy registers each new task definition revision itself).
   # ---------------------------------------------------------------------------
   Service:
     Type: AWS::ECS::Service
-    DependsOn: [HttpListener, ClusterCapacityProviders]
+    DependsOn: [HttpListener, TestListener, ClusterCapacityProviders]
     Properties:
-      ServiceName: product-service
+      ServiceName: product-service-bg
       Cluster: !Ref Cluster
-      TaskDefinition: !Ref TaskDefinition   # new revision -> rolling deployment
+      DeploymentController:
+        Type: CODE_DEPLOY
+      TaskDefinition: !Ref TaskDefinition   # only used when the service is first created
       DesiredCount: 2                       # two copies for availability
       CapacityProviderStrategy:
         - CapacityProvider: !Ref CapacityProvider
           Weight: 1
       LoadBalancers:
-        - TargetGroupArn: !Ref TargetGroup
+        - TargetGroupArn: !Ref TargetGroupBlue   # starts on blue; CodeDeploy swaps later
           ContainerName: product-service
           ContainerPort: 3000
       # Ignore failing ALB health checks for the first 60s while a task boots.
       HealthCheckGracePeriodSeconds: 60
-      DeploymentConfiguration:
-        # Rolling update: start new tasks first (up to 200%), and never drop
-        # below 100% healthy - users always have working tasks to hit.
-        MinimumHealthyPercent: 100
-        MaximumPercent: 200
-        # If new tasks keep failing, stop the deployment and automatically
-        # roll back to the last working revision.
-        DeploymentCircuitBreaker:
-          Enable: true
-          Rollback: true
+      # (No rolling-update settings or circuit breaker: CodeDeploy controls
+      #  deployments now, and rolls back automatically if one fails.)
       PlacementStrategies:
         # First spread tasks across Availability Zones (survive an AZ outage)...
         - Type: spread
@@ -515,6 +565,76 @@ Resources:
         TargetValue: 50
         ScaleOutCooldown: 60     # react quickly to load
         ScaleInCooldown: 300     # remove capacity slowly, avoids flapping
+
+  # ---------------------------------------------------------------------------
+  # CI/CD EXERCISE - CODEDEPLOY BLUE/GREEN
+  # The pipeline (infra/pipeline.yaml) hands each new version to this
+  # deployment group, which:
+  #   1. starts a full set of GREEN tasks on the idle target group
+  #   2. points the TEST listener (8080) at them and WAITS for approval
+  #   3. on approval, switches the PRODUCTION listener (80) to green - instantly
+  #   4. keeps the old BLUE tasks for 5 minutes (instant rollback), then stops them
+  # If green tasks fail, it rolls back automatically.
+  # ---------------------------------------------------------------------------
+  CodeDeployServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: codedeploy.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        # AWS-managed policy: lets CodeDeploy manage ECS task sets, the
+        # load balancer listeners/target groups, and pass the task roles.
+        - arn:aws:iam::aws:policy/AWSCodeDeployRoleForECS
+
+  CodeDeployApplication:
+    Type: AWS::CodeDeploy::Application
+    Properties:
+      ApplicationName: project5-product-service
+      ComputePlatform: ECS
+
+  CodeDeployDeploymentGroup:
+    Type: AWS::CodeDeploy::DeploymentGroup
+    Properties:
+      ApplicationName: !Ref CodeDeployApplication
+      DeploymentGroupName: project5-product-service-dg
+      ServiceRoleArn: !GetAtt CodeDeployServiceRole.Arn
+      # ECSAllAtOnce = shift 100% of traffic in one step once approved.
+      # (Alternatives: ECSCanary10Percent5Minutes, ECSLinear10PercentEvery1Minutes)
+      DeploymentConfigName: CodeDeployDefault.ECSAllAtOnce
+      DeploymentStyle:
+        DeploymentType: BLUE_GREEN
+        DeploymentOption: WITH_TRAFFIC_CONTROL
+      BlueGreenDeploymentConfiguration:
+        # "Test & Validate": pause with green on the test port for up to 15
+        # minutes. You approve ("Reroute traffic") or it stops and rolls back.
+        # Set ActionOnTimeout: CONTINUE_DEPLOYMENT + WaitTimeInMinutes: 0 to
+        # switch automatically with no pause.
+        DeploymentReadyOption:
+          ActionOnTimeout: STOP_DEPLOYMENT
+          WaitTimeInMinutes: 15
+        # "Decommission blue": keep old tasks 5 minutes for instant rollback.
+        TerminateBlueInstancesOnDeploymentSuccess:
+          Action: TERMINATE
+          TerminationWaitTimeInMinutes: 5
+      AutoRollbackConfiguration:
+        Enabled: true
+        Events: [DEPLOYMENT_FAILURE, DEPLOYMENT_STOP_ON_REQUEST]
+      ECSServices:
+        - ClusterName: !Ref Cluster
+          ServiceName: !GetAtt Service.Name
+      LoadBalancerInfo:
+        TargetGroupPairInfoList:
+          - TargetGroups:
+              - Name: !GetAtt TargetGroupBlue.TargetGroupName
+              - Name: !GetAtt TargetGroupGreen.TargetGroupName
+            ProdTrafficRoute:
+              ListenerArns: [!Ref HttpListener]
+            TestTrafficRoute:
+              ListenerArns: [!Ref TestListener]
 
   # ---------------------------------------------------------------------------
   # MONITORING EXERCISE - CloudWatch dashboard
@@ -590,11 +710,11 @@ Resources:
             {
               "type": "metric", "x": 12, "y": 12, "width": 12, "height": 6,
               "properties": {
-                "title": "Healthy targets behind the load balancer",
+                "title": "Healthy targets - blue vs green (watch them swap on deploys)",
                 "region": "${AWS::Region}", "view": "timeSeries", "stat": "Minimum", "period": 60,
                 "metrics": [
-                  [ "AWS/ApplicationELB", "HealthyHostCount",   "TargetGroup", "${TargetGroup.TargetGroupFullName}", "LoadBalancer", "${LoadBalancer.LoadBalancerFullName}" ],
-                  [ "AWS/ApplicationELB", "UnHealthyHostCount", "TargetGroup", "${TargetGroup.TargetGroupFullName}", "LoadBalancer", "${LoadBalancer.LoadBalancerFullName}" ]
+                  [ "AWS/ApplicationELB", "HealthyHostCount", "TargetGroup", "${TargetGroupBlue.TargetGroupFullName}",  "LoadBalancer", "${LoadBalancer.LoadBalancerFullName}", { "label": "Blue healthy" } ],
+                  [ "AWS/ApplicationELB", "HealthyHostCount", "TargetGroup", "${TargetGroupGreen.TargetGroupFullName}", "LoadBalancer", "${LoadBalancer.LoadBalancerFullName}", { "label": "Green healthy" } ]
                 ]
               }
             }
@@ -611,6 +731,13 @@ Outputs:
   LoadBalancerUrl:
     Description: Public URL of the Product Service
     Value: !Sub 'http://${LoadBalancer.DNSName}/products'
+  TestUrl:
+    Description: Blue/green test URL - shows the NEW version while a deployment awaits approval
+    Value: !Sub 'http://${LoadBalancer.DNSName}:8080/products'
+  CodeDeployApplicationName:
+    Value: !Ref CodeDeployApplication
+  CodeDeployDeploymentGroupName:
+    Value: project5-product-service-dg
   ServiceName:
     Value: !GetAtt Service.Name
   ClusterName:
