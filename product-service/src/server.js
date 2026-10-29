@@ -49,6 +49,14 @@ const server = app.listen(PORT, '0.0.0.0', () => {
   }
 });
 
+// Keep-alive timeouts MUST be longer than the ALB's idle timeout (60s).
+// Node's default is 5s: Node would close an idle connection the ALB still
+// thinks is open, the ALB reuses it for the next request, and that request
+// gets a 502 Bad Gateway. Making Node wait longer than the ALB means the ALB
+// always closes first, so it never sends a request down a dead connection.
+server.keepAliveTimeout = 65000;  // 65s > ALB's 60s idle timeout
+server.headersTimeout = 66000;    // must be greater than keepAliveTimeout
+
 // Graceful shutdown. When ECS stops a task (deploys, scale-in, Spot
 // interruption) it sends SIGTERM and waits before force-killing it.
 // We stop accepting new requests, let in-flight ones finish, close DB

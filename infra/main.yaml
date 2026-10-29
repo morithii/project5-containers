@@ -271,6 +271,12 @@ Resources:
 
   ContainerHostAutoScalingGroup:
     Type: AWS::AutoScaling::AutoScalingGroup
+    # Hosts have public IPs, so they need the internet gateway. DependsOn makes
+    # CloudFormation create the gateway attachment BEFORE the hosts, and - just
+    # as important - delete the hosts BEFORE detaching the gateway. Without it,
+    # stack deletion tries to detach the gateway while hosts still use it, fails,
+    # and leaves the hosts cut off from ECS (so the Service delete hangs too).
+    DependsOn: InternetGatewayAttachment
     Properties:
       VPCZoneIdentifier: [!Ref PublicSubnetA, !Ref PublicSubnetB]
       LaunchTemplate:
@@ -393,6 +399,7 @@ Resources:
   # ---------------------------------------------------------------------------
   LoadBalancer:
     Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    DependsOn: InternetGatewayAttachment   # same reason as the Auto Scaling Group
     Properties:
       Name: project5-alb
       Scheme: internet-facing
