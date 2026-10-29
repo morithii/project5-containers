@@ -4,6 +4,7 @@ Description: >
   Exercise 3: VPC + RDS MySQL + ECS cluster on a Graviton Auto Scaling Group + task definition.
   Exercise 4: ECS Service behind an Application Load Balancer, with service auto scaling.
   CI/CD exercise: CodeDeploy blue/green (two target groups, test listener, deployment group).
+  Optimisation exercise: tasks moved from EC2 hosts to AWS Fargate (serverless containers).
 
 # =============================================================================
 # PARAMETERS
@@ -168,6 +169,23 @@ Resources:
       # (needed to reach ECR, CloudWatch Logs, Secrets Manager and RDS).
       Tags: [{ Key: Name, Value: project5-hosts-sg }]
 
+  # FARGATE: with awsvpc networking every TASK gets its own network interface
+  # and IP address, so the firewall is attached to the task itself - not to a
+  # host. Tasks listen on their real port 3000 (no more random host ports).
+  TaskSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Product Service Fargate tasks
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3000
+          ToPort: 3000
+          SourceSecurityGroupId: !Ref LoadBalancerSecurityGroup
+          Description: App port - from the ALB only
+      # Default allow-all outbound: reach ECR, CloudWatch Logs, Secrets Manager, RDS
+      Tags: [{ Key: Name, Value: project5-tasks-sg }]
+
   DatabaseSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
@@ -180,7 +198,12 @@ Resources:
           FromPort: 3306
           ToPort: 3306
           SourceSecurityGroupId: !Ref ContainerHostSecurityGroup
-          Description: MySQL from ECS container hosts
+          Description: MySQL from ECS container hosts (EC2 - removed in phase 2)
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !Ref TaskSecurityGroup
+          Description: MySQL from Fargate tasks
       Tags: [{ Key: Name, Value: project5-db-sg }]
 
   # ---------------------------------------------------------------------------
@@ -321,9 +344,13 @@ Resources:
     Type: AWS::ECS::ClusterCapacityProviderAssociations
     Properties:
       Cluster: !Ref Cluster
-      CapacityProviders: [!Ref CapacityProvider]
+      # FARGATE and FARGATE_SPOT are built-in capacity providers - AWS runs the
+      # servers. The EC2 capacity provider stays associated for THIS deploy only,
+      # because the old service still uses it until CloudFormation deletes it.
+      # Phase 2 removes it (and all the EC2 resources).
+      CapacityProviders: [FARGATE, FARGATE_SPOT, !Ref CapacityProvider]
       DefaultCapacityProviderStrategy:
-        - CapacityProvider: !Ref CapacityProvider
+        - CapacityProvider: FARGATE
           Weight: 1
 
   # ---------------------------------------------------------------------------
@@ -363,19 +390,23 @@ Resources:
     Type: AWS::ECS::TaskDefinition
     Properties:
       Family: product-service
-      RequiresCompatibilities: [EC2]
-      NetworkMode: bridge                # Docker's bridge network on each host
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc                # required by Fargate: each task gets its own IP
+      # Fargate sizes are set for the whole TASK and must be a valid pair
+      # (0.25 vCPU with 0.5/1/2 GB). You pay for exactly this, per second.
+      Cpu: '256'                         # 0.25 vCPU
+      Memory: '512'                      # 0.5 GB
+      # Our image is ARM64 - Fargate on Graviton is ~20% cheaper than x86.
+      RuntimePlatform:
+        CpuArchitecture: ARM64
+        OperatingSystemFamily: LINUX
       ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
       ContainerDefinitions:
         - Name: product-service
           Image: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/product-service:${ImageTag}'
           Essential: true
-          Cpu: 256                       # 1/4 of a vCPU reserved
-          MemoryReservation: 256         # soft limit (MiB) used for placement...
-          Memory: 512                    # ...hard limit: container is killed above this
           PortMappings:
-            - ContainerPort: 3000
-              HostPort: 0                # 0 = Docker picks a free host port (dynamic)
+            - ContainerPort: 3000        # awsvpc: host port is always the same as the container port
               Protocol: tcp
           Environment:
             - { Name: DB_HOST, Value: !GetAtt Database.Endpoint.Address }
@@ -420,9 +451,10 @@ Resources:
       SecurityGroups: [!Ref LoadBalancerSecurityGroup]
 
   # Target groups = the lists of places the ALB can send traffic to.
-  # TargetType "instance" + bridge networking: each target is an EC2 host
-  # PLUS the dynamic port of one task on it. ECS registers and deregisters
-  # tasks automatically as they start and stop.
+  # FARGATE: TargetType "ip" - each target is a TASK's own IP address on port
+  # 3000 (there are no EC2 hosts any more). A target group's type can't be
+  # changed, so these are NEW target groups (new names) replacing the old ones.
+  # ECS registers and deregisters tasks automatically as they start and stop.
   #
   # BLUE/GREEN needs TWO identical target groups. At any moment one holds the
   # live version (production traffic) and the other receives the new version
@@ -431,11 +463,11 @@ Resources:
   TargetGroupBlue:
     Type: AWS::ElasticLoadBalancingV2::TargetGroup
     Properties:
-      Name: project5-tg-blue
+      Name: project5-tg-blue-ip
       VpcId: !Ref Vpc
       Protocol: HTTP
-      Port: 3000                       # placeholder - ECS supplies the real port per task
-      TargetType: instance
+      Port: 3000
+      TargetType: ip
       HealthCheckPath: /health         # the DB-independent health endpoint
       HealthCheckPort: traffic-port    # check each task on ITS dynamic port
       HealthCheckIntervalSeconds: 15
@@ -451,11 +483,11 @@ Resources:
   TargetGroupGreen:
     Type: AWS::ElasticLoadBalancingV2::TargetGroup
     Properties:
-      Name: project5-tg-green
+      Name: project5-tg-green-ip
       VpcId: !Ref Vpc
       Protocol: HTTP
       Port: 3000
-      TargetType: instance
+      TargetType: ip
       HealthCheckPath: /health
       HealthCheckPort: traffic-port
       HealthCheckIntervalSeconds: 15
@@ -510,15 +542,26 @@ Resources:
     Type: AWS::ECS::Service
     DependsOn: [HttpListener, TestListener, ClusterCapacityProviders]
     Properties:
-      ServiceName: product-service-bg
+      # New name again: launch type, networking and target groups can't change
+      # on an existing service, so the Fargate version is a NEW service.
+      ServiceName: product-service-fargate
       Cluster: !Ref Cluster
       DeploymentController:
         Type: CODE_DEPLOY
       TaskDefinition: !Ref TaskDefinition   # only used when the service is first created
       DesiredCount: 2                       # two copies for availability
       CapacityProviderStrategy:
-        - CapacityProvider: !Ref CapacityProvider
+        - CapacityProvider: FARGATE      # regular (on-demand) Fargate
           Weight: 1
+      # awsvpc networking: which subnets and firewall each task's network
+      # interface uses. Public subnets + public IP so tasks can reach ECR,
+      # Secrets Manager and CloudWatch without a NAT gateway (~$35/month saved).
+      # Inbound is still ONLY from the ALB, via the task security group.
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          Subnets: [!Ref PublicSubnetA, !Ref PublicSubnetB]   # Fargate spreads tasks across both AZs
+          SecurityGroups: [!Ref TaskSecurityGroup]
+          AssignPublicIp: ENABLED
       LoadBalancers:
         - TargetGroupArn: !Ref TargetGroupBlue   # starts on blue; CodeDeploy swaps later
           ContainerName: product-service
@@ -527,13 +570,8 @@ Resources:
       HealthCheckGracePeriodSeconds: 60
       # (No rolling-update settings or circuit breaker: CodeDeploy controls
       #  deployments now, and rolls back automatically if one fails.)
-      PlacementStrategies:
-        # First spread tasks across Availability Zones (survive an AZ outage)...
-        - Type: spread
-          Field: attribute:ecs.availability-zone
-        # ...then pack them onto as few hosts as possible (fewer EC2 bills).
-        - Type: binpack
-          Field: memory
+      # (No placement strategies: there are no hosts to choose between -
+      #  Fargate spreads tasks across Availability Zones automatically.)
 
   # ---------------------------------------------------------------------------
   # EXERCISE 4 - SERVICE AUTO SCALING (tasks)
@@ -652,13 +690,12 @@ Resources:
             {
               "type": "metric", "x": 0, "y": 0, "width": 12, "height": 6,
               "properties": {
-                "title": "Cluster reservation (%) - how full the EC2 hosts are",
-                "region": "${AWS::Region}", "view": "timeSeries", "stat": "Average", "period": 60,
+                "title": "CPU used vs reserved (CPU units, Container Insights) - Fargate has no hosts to fill",
+                "region": "${AWS::Region}", "view": "timeSeries", "stat": "Sum", "period": 60,
                 "metrics": [
-                  [ "AWS/ECS", "CPUReservation",    "ClusterName", "${Cluster}" ],
-                  [ "AWS/ECS", "MemoryReservation", "ClusterName", "${Cluster}" ]
-                ],
-                "yAxis": { "left": { "min": 0, "max": 100 } }
+                  [ "ECS/ContainerInsights", "CpuUtilized", "ClusterName", "${Cluster}", "ServiceName", "${Service.Name}" ],
+                  [ "ECS/ContainerInsights", "CpuReserved", "ClusterName", "${Cluster}", "ServiceName", "${Service.Name}" ]
+                ]
               }
             },
             {
