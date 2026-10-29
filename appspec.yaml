@@ -11,3 +11,25 @@ Resources:
         LoadBalancerInfo:
           ContainerName: product-service   # must match the container name in the task definition
           ContainerPort: 3000              # the port the app listens on inside the container
+
+        # FARGATE SPOT exercise - "baseline on regular capacity, scale out on Spot".
+        # With CodeDeploy in control, each deployment creates a new set of tasks
+        # (a "task set"), and THIS is where its capacity mix is defined.
+        #
+        #   FARGATE       Base: 2  -> the first 2 tasks ALWAYS run on regular
+        #                 Weight: 0   Fargate: a stable baseline that AWS will
+        #                             never take away.
+        #   FARGATE_SPOT  Weight: 1  -> every task ABOVE the baseline (added by
+        #                             auto scaling under load) runs on Spot:
+        #                             spare AWS capacity, ~70% cheaper, which AWS
+        #                             can reclaim with a 2-minute warning.
+        #
+        # Spot interruptions are safe here: the app shuts down gracefully on
+        # SIGTERM, the ALB stops sending it traffic, and the service replaces it.
+        CapacityProviderStrategy:
+          - CapacityProvider: FARGATE
+            Base: 2
+            Weight: 0
+          - CapacityProvider: FARGATE_SPOT
+            Base: 0
+            Weight: 1
