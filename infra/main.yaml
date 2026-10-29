@@ -1,6 +1,6 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: >
-  Project 5 - Product Service on Amazon ECS (EC2 launch type).
+  Project 5 - Product Service on Amazon ECS with AWS Fargate (started on EC2 in Exercise 3).
   Exercise 3: VPC + RDS MySQL + ECS cluster on a Graviton Auto Scaling Group + task definition.
   Exercise 4: ECS Service behind an Application Load Balancer, with service auto scaling.
   CI/CD exercise: CodeDeploy blue/green (two target groups, test listener, deployment group).
@@ -15,18 +15,6 @@ Parameters:
     Default: v2
     Description: Tag of the product-service image in ECR to run (the pipeline passes the git SHA)
 
-  InstanceType:
-    Type: String
-    Default: t4g.small     # Graviton (ARM64), 2 vCPU / 2 GiB - matches our arm64 image
-    AllowedValues: [t4g.micro, t4g.small, t4g.medium]
-
-  # AWS publishes the latest ECS-optimized AMI ID in SSM Parameter Store.
-  # This "SSM parameter type" makes CloudFormation look it up at deploy time,
-  # so the hosts always launch with the current, patched ECS AMI.
-  EcsAmiId:
-    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
-    Default: /aws/service/ecs/optimized-ami/amazon-linux-2023/arm64/recommended/image_id
-
 # =============================================================================
 # RESOURCES
 # =============================================================================
@@ -34,11 +22,11 @@ Resources:
 
   # ---------------------------------------------------------------------------
   # NETWORKING
-  # 2 public subnets  -> container hosts (and the ALB in Exercise 4)
+  # 2 public subnets  -> the ALB and the Fargate tasks
   # 2 private subnets -> RDS (no route to the internet at all)
-  # No NAT gateway on purpose: it costs ~$35/month. The hosts have public IPs
-  # so the ECS agent can pull images from ECR, but their security group only
-  # lets in traffic we explicitly allow.
+  # No NAT gateway on purpose: it costs ~$35/month. Tasks get public IPs so
+  # they can pull images from ECR, but their security group only lets in
+  # traffic from the load balancer.
   # ---------------------------------------------------------------------------
   Vpc:
     Type: AWS::EC2::VPC
@@ -149,26 +137,7 @@ Resources:
           Description: Blue/green test traffic
       Tags: [{ Key: Name, Value: project5-alb-sg }]
 
-  # ...but the container hosts now accept traffic ONLY from the load balancer.
-  # (Exercise 3's temporary "my IP" rule is gone.)
-  ContainerHostSecurityGroup:
-    Type: AWS::EC2::SecurityGroup
-    Properties:
-      GroupDescription: ECS container hosts - Product Service
-      VpcId: !Ref Vpc
-      SecurityGroupIngress:
-        # Bridge networking with dynamic host ports: Docker maps container
-        # port 3000 to a random host port in the Linux ephemeral range, and
-        # the ALB sends traffic to whichever port each task got.
-        - IpProtocol: tcp
-          FromPort: 32768
-          ToPort: 65535
-          SourceSecurityGroupId: !Ref LoadBalancerSecurityGroup
-          Description: Dynamic container ports - from the ALB only
-      # No egress rules listed = default "allow all outbound"
-      # (needed to reach ECR, CloudWatch Logs, Secrets Manager and RDS).
-      Tags: [{ Key: Name, Value: project5-hosts-sg }]
-
+  # ...and the Fargate tasks accept traffic ONLY from the load balancer.
   # FARGATE: with awsvpc networking every TASK gets its own network interface
   # and IP address, so the firewall is attached to the task itself - not to a
   # host. Tasks listen on their real port 3000 (no more random host ports).
@@ -189,16 +158,11 @@ Resources:
   DatabaseSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: RDS MySQL - only reachable from the container hosts
+      GroupDescription: RDS MySQL - only reachable from the Product Service tasks
       VpcId: !Ref Vpc
       SecurityGroupIngress:
-        # Referencing a security group (not an IP range) means "any instance
-        # in that group" - so new hosts added by Auto Scaling get access automatically.
-        - IpProtocol: tcp
-          FromPort: 3306
-          ToPort: 3306
-          SourceSecurityGroupId: !Ref ContainerHostSecurityGroup
-          Description: MySQL from ECS container hosts (EC2 - removed in phase 2)
+        # Referencing a security group (not an IP range) means "anything in
+        # that group" - so every new task auto scaling starts gets access automatically.
         - IpProtocol: tcp
           FromPort: 3306
           ToPort: 3306
@@ -243,7 +207,9 @@ Resources:
       DeletionProtection: false
 
   # ---------------------------------------------------------------------------
-  # ECS CLUSTER + EC2 CAPACITY
+  # ECS CLUSTER - Fargate only
+  # The EC2 hosts, launch template, Auto Scaling Group and EC2 capacity
+  # provider are gone: AWS runs the servers. Nothing to patch or scale.
   # ---------------------------------------------------------------------------
   Cluster:
     Type: AWS::ECS::Cluster
@@ -256,99 +222,13 @@ Resources:
         - Name: containerInsights
           Value: enabled
 
-  # IAM role for the EC2 hosts: lets the ECS agent register with the cluster,
-  # pull images from ECR and write container logs.
-  ContainerHostRole:
-    Type: AWS::IAM::Role
-    Properties:
-      AssumeRolePolicyDocument:
-        Version: '2012-10-17'
-        Statement:
-          - Effect: Allow
-            Principal: { Service: ec2.amazonaws.com }
-            Action: sts:AssumeRole
-      ManagedPolicyArns:
-        - arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceforEC2Role
-        # Session Manager: open a shell on a host from the console/CLI without
-        # SSH keys or an open port 22 - handy for debugging.
-        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
-
-  # An instance profile is the "container" that attaches an IAM role to EC2
-  ContainerHostInstanceProfile:
-    Type: AWS::IAM::InstanceProfile
-    Properties:
-      Roles: [!Ref ContainerHostRole]
-
-  # Launch template = the blueprint for every host the Auto Scaling Group starts
-  ContainerHostLaunchTemplate:
-    Type: AWS::EC2::LaunchTemplate
-    Properties:
-      LaunchTemplateData:
-        ImageId: !Ref EcsAmiId
-        InstanceType: !Ref InstanceType
-        IamInstanceProfile:
-          Arn: !GetAtt ContainerHostInstanceProfile.Arn
-        NetworkInterfaces:
-          - DeviceIndex: 0
-            AssociatePublicIpAddress: true
-            Groups: [!Ref ContainerHostSecurityGroup]
-        MetadataOptions:
-          HttpTokens: required           # IMDSv2 only (blocks SSRF-style credential theft)
-          HttpPutResponseHopLimit: 1     # containers can't reach the host's metadata/credentials
-        # Runs once at first boot: tells the ECS agent which cluster to join.
-        UserData:
-          Fn::Base64: !Sub |
-            #!/bin/bash
-            echo "ECS_CLUSTER=${Cluster}" >> /etc/ecs/ecs.config
-        TagSpecifications:
-          - ResourceType: instance
-            Tags: [{ Key: Name, Value: project5-ecs-host }]
-
-  ContainerHostAutoScalingGroup:
-    Type: AWS::AutoScaling::AutoScalingGroup
-    # Hosts have public IPs, so they need the internet gateway. DependsOn makes
-    # CloudFormation create the gateway attachment BEFORE the hosts, and - just
-    # as important - delete the hosts BEFORE detaching the gateway. Without it,
-    # stack deletion tries to detach the gateway while hosts still use it, fails,
-    # and leaves the hosts cut off from ECS (so the Service delete hangs too).
-    DependsOn: InternetGatewayAttachment
-    Properties:
-      VPCZoneIdentifier: [!Ref PublicSubnetA, !Ref PublicSubnetB]
-      LaunchTemplate:
-        LaunchTemplateId: !Ref ContainerHostLaunchTemplate
-        Version: !GetAtt ContainerHostLaunchTemplate.LatestVersionNumber
-      # MinSize 0: with no tasks running there are no hosts and no EC2 bill.
-      # ECS managed scaling (below) adds a host when a task needs one.
-      MinSize: '0'
-      MaxSize: '2'
-      Tags:
-        # Required by ECS managed scaling to recognise its own instances
-        - Key: AmazonECSManaged
-          Value: ''
-          PropagateAtLaunch: true
-
-  # Capacity provider = the link between the cluster and the ASG.
-  # Managed scaling: ECS watches how full the hosts are and grows/shrinks the
-  # ASG so there's always room for the tasks you ask for.
-  CapacityProvider:
-    Type: AWS::ECS::CapacityProvider
-    Properties:
-      AutoScalingGroupProvider:
-        AutoScalingGroupArn: !Ref ContainerHostAutoScalingGroup
-        ManagedScaling:
-          Status: ENABLED
-          TargetCapacity: 100            # aim for hosts to be fully used
-        ManagedTerminationProtection: DISABLED
-
   ClusterCapacityProviders:
     Type: AWS::ECS::ClusterCapacityProviderAssociations
     Properties:
       Cluster: !Ref Cluster
-      # FARGATE and FARGATE_SPOT are built-in capacity providers - AWS runs the
-      # servers. The EC2 capacity provider stays associated for THIS deploy only,
-      # because the old service still uses it until CloudFormation deletes it.
-      # Phase 2 removes it (and all the EC2 resources).
-      CapacityProviders: [FARGATE, FARGATE_SPOT, !Ref CapacityProvider]
+      # FARGATE (regular) and FARGATE_SPOT (spare capacity, ~70% cheaper) are
+      # built-in capacity providers - AWS runs the servers.
+      CapacityProviders: [FARGATE, FARGATE_SPOT]
       DefaultCapacityProviderStrategy:
         - CapacityProvider: FARGATE
           Weight: 1
@@ -442,7 +322,10 @@ Resources:
   # ---------------------------------------------------------------------------
   LoadBalancer:
     Type: AWS::ElasticLoadBalancingV2::LoadBalancer
-    DependsOn: InternetGatewayAttachment   # same reason as the Auto Scaling Group
+    # The ALB has public IPs, so it needs the internet gateway. DependsOn makes
+    # CloudFormation attach the gateway BEFORE creating the ALB and - just as
+    # important - delete the ALB BEFORE detaching the gateway on stack deletion.
+    DependsOn: InternetGatewayAttachment
     Properties:
       Name: project5-alb
       Scheme: internet-facing
@@ -779,8 +662,6 @@ Outputs:
     Value: !GetAtt Service.Name
   ClusterName:
     Value: !Ref Cluster
-  CapacityProviderName:
-    Value: !Ref CapacityProvider
   TaskDefinitionArn:
     Value: !Ref TaskDefinition
   DatabaseEndpoint:
