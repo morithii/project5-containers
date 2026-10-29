@@ -218,8 +218,11 @@ Resources:
     Properties:
       ClusterName: project5-cluster
       ClusterSettings:
+        # Monitoring exercise: Container Insights publishes extra per-service
+        # metrics (DesiredTaskCount, RunningTaskCount, ...) to CloudWatch.
+        # Small extra cost - roughly a few dollars/month for one small service.
         - Name: containerInsights
-          Value: disabled                # extra cost; basic ECS metrics are free
+          Value: enabled
 
   # IAM role for the EC2 hosts: lets the ECS agent register with the cluster,
   # pull images from ECR and write container logs.
@@ -513,10 +516,98 @@ Resources:
         ScaleOutCooldown: 60     # react quickly to load
         ScaleInCooldown: 300     # remove capacity slowly, avoids flapping
 
+  # ---------------------------------------------------------------------------
+  # MONITORING EXERCISE - CloudWatch dashboard
+  # One screen showing cluster capacity, task counts and load balancer traffic.
+  # !Sub fills in the real cluster/service/ALB names, so the dashboard always
+  # points at THIS stack's resources.
+  # ---------------------------------------------------------------------------
+  Dashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: project5-product-service
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric", "x": 0, "y": 0, "width": 12, "height": 6,
+              "properties": {
+                "title": "Cluster reservation (%) - how full the EC2 hosts are",
+                "region": "${AWS::Region}", "view": "timeSeries", "stat": "Average", "period": 60,
+                "metrics": [
+                  [ "AWS/ECS", "CPUReservation",    "ClusterName", "${Cluster}" ],
+                  [ "AWS/ECS", "MemoryReservation", "ClusterName", "${Cluster}" ]
+                ],
+                "yAxis": { "left": { "min": 0, "max": 100 } }
+              }
+            },
+            {
+              "type": "metric", "x": 12, "y": 0, "width": 12, "height": 6,
+              "properties": {
+                "title": "Tasks - desired vs running (Container Insights)",
+                "region": "${AWS::Region}", "view": "timeSeries", "stat": "Average", "period": 60,
+                "metrics": [
+                  [ "ECS/ContainerInsights", "DesiredTaskCount", "ClusterName", "${Cluster}", "ServiceName", "${Service.Name}" ],
+                  [ "ECS/ContainerInsights", "RunningTaskCount", "ClusterName", "${Cluster}", "ServiceName", "${Service.Name}" ]
+                ]
+              }
+            },
+            {
+              "type": "metric", "x": 0, "y": 6, "width": 12, "height": 6,
+              "properties": {
+                "title": "Service CPU / memory utilisation (%) - drives auto scaling",
+                "region": "${AWS::Region}", "view": "timeSeries", "stat": "Average", "period": 60,
+                "metrics": [
+                  [ "AWS/ECS", "CPUUtilization",    "ClusterName", "${Cluster}", "ServiceName", "${Service.Name}" ],
+                  [ "AWS/ECS", "MemoryUtilization", "ClusterName", "${Cluster}", "ServiceName", "${Service.Name}" ]
+                ],
+                "annotations": { "horizontal": [ { "label": "Scaling target", "value": 50 } ] }
+              }
+            },
+            {
+              "type": "metric", "x": 12, "y": 6, "width": 12, "height": 6,
+              "properties": {
+                "title": "Load balancer - requests and errors",
+                "region": "${AWS::Region}", "view": "timeSeries", "stat": "Sum", "period": 60,
+                "metrics": [
+                  [ "AWS/ApplicationELB", "RequestCount",               "LoadBalancer", "${LoadBalancer.LoadBalancerFullName}" ],
+                  [ "AWS/ApplicationELB", "HTTPCode_Target_4XX_Count",  "LoadBalancer", "${LoadBalancer.LoadBalancerFullName}" ],
+                  [ "AWS/ApplicationELB", "HTTPCode_ELB_5XX_Count",     "LoadBalancer", "${LoadBalancer.LoadBalancerFullName}" ]
+                ]
+              }
+            },
+            {
+              "type": "metric", "x": 0, "y": 12, "width": 12, "height": 6,
+              "properties": {
+                "title": "Response time (seconds) - p50 and p99",
+                "region": "${AWS::Region}", "view": "timeSeries", "period": 60,
+                "metrics": [
+                  [ "AWS/ApplicationELB", "TargetResponseTime", "LoadBalancer", "${LoadBalancer.LoadBalancerFullName}", { "stat": "p50" } ],
+                  [ "AWS/ApplicationELB", "TargetResponseTime", "LoadBalancer", "${LoadBalancer.LoadBalancerFullName}", { "stat": "p99" } ]
+                ]
+              }
+            },
+            {
+              "type": "metric", "x": 12, "y": 12, "width": 12, "height": 6,
+              "properties": {
+                "title": "Healthy targets behind the load balancer",
+                "region": "${AWS::Region}", "view": "timeSeries", "stat": "Minimum", "period": 60,
+                "metrics": [
+                  [ "AWS/ApplicationELB", "HealthyHostCount",   "TargetGroup", "${TargetGroup.TargetGroupFullName}", "LoadBalancer", "${LoadBalancer.LoadBalancerFullName}" ],
+                  [ "AWS/ApplicationELB", "UnHealthyHostCount", "TargetGroup", "${TargetGroup.TargetGroupFullName}", "LoadBalancer", "${LoadBalancer.LoadBalancerFullName}" ]
+                ]
+              }
+            }
+          ]
+        }
+
 # =============================================================================
 # OUTPUTS
 # =============================================================================
 Outputs:
+  DashboardUrl:
+    Description: Open this to see the CloudWatch dashboard
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=project5-product-service'
   LoadBalancerUrl:
     Description: Public URL of the Product Service
     Value: !Sub 'http://${LoadBalancer.DNSName}/products'
